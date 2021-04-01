@@ -58,6 +58,16 @@ func (ctx *SigningContext) digest(el *etree.Element) ([]byte, error) {
 	return hash.Sum(nil), nil
 }
 
+func (ctx *SigningContext) digestString(content string) ([]byte, error) {
+	hash := ctx.Hash.New()
+	_, err := hash.Write([]byte(content))
+	if err != nil {
+		return nil, err
+	}
+
+	return hash.Sum(nil), nil
+}
+
 func (ctx *SigningContext) constructSignedInfo(el *etree.Element, enveloped bool) (*etree.Element, error) {
 	digestAlgorithmIdentifier := ctx.GetDigestAlgorithmIdentifier()
 	if digestAlgorithmIdentifier == "" {
@@ -115,6 +125,120 @@ func (ctx *SigningContext) constructSignedInfo(el *etree.Element, enveloped bool
 	digestValue.SetText(base64.StdEncoding.EncodeToString(digest))
 
 	return signedInfo, nil
+}
+
+func (ctx *SigningContext) ConstructSignedInfo(el *etree.Element, enveloped bool) (*etree.Element, error) {
+	return ctx.constructSignedInfo(el, enveloped)
+}
+
+func (ctx *SigningContext) InsertReferenceToSignedInfo(signedInfo *etree.Element, dataId, content string) error {
+	if dataId == "" {
+		return errors.New("Missing data ID")
+	}
+
+	digestAlgorithmIdentifier := ctx.GetDigestAlgorithmIdentifier()
+	if digestAlgorithmIdentifier == "" {
+		return errors.New("unsupported hash mechanism")
+	}
+
+	digest, err := ctx.digestString(content)
+	if err != nil {
+		return err
+	}
+
+	// /SignedInfo/Reference
+	reference := ctx.createNamespacedElement(signedInfo, ReferenceTag)
+	reference.CreateAttr(URIAttr, "#"+dataId)
+
+	// /SignedInfo/Reference/DigestMethod
+	digestMethod := ctx.createNamespacedElement(reference, DigestMethodTag)
+	digestMethod.CreateAttr(AlgorithmAttr, digestAlgorithmIdentifier)
+
+	// /SignedInfo/Reference/DigestValue
+	digestValue := ctx.createNamespacedElement(reference, DigestValueTag)
+	digestValue.SetText(base64.StdEncoding.EncodeToString(digest))
+
+	return nil
+}
+
+func (ctx *SigningContext) ConstructSignatureWithSignedInfo(signedInfo, el *etree.Element, enveloped bool) (*etree.Element, error) {
+	sig := &etree.Element{
+		Tag:   SignatureTag,
+		Space: ctx.Prefix,
+	}
+
+	xmlns := "xmlns"
+	if ctx.Prefix != "" {
+		xmlns += ":" + ctx.Prefix
+	}
+
+	sig.CreateAttr(xmlns, Namespace)
+	sig.AddChild(signedInfo)
+
+	// When using xml-c14n11 (ie, non-exclusive canonicalization) the canonical form
+	// of the SignedInfo must declare all namespaces that are in scope at it's final
+	// enveloped location in the document. In order to do that, we're going to construct
+	// a series of cascading NSContexts to capture namespace declarations:
+
+	// First get the context surrounding the element we are signing.
+	rootNSCtx, err := etreeutils.NSBuildParentContext(el)
+	if err != nil {
+		return nil, err
+	}
+
+	// Then capture any declarations on the element itself.
+	elNSCtx, err := rootNSCtx.SubContext(el)
+	if err != nil {
+		return nil, err
+	}
+
+	// Followed by declarations on the Signature (which we just added above)
+	sigNSCtx, err := elNSCtx.SubContext(sig)
+	if err != nil {
+		return nil, err
+	}
+
+	// Finally detatch the SignedInfo in order to capture all of the namespace
+	// declarations in the scope we've constructed.
+	detatchedSignedInfo, err := etreeutils.NSDetatch(sigNSCtx, signedInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	digest, err := ctx.digest(detatchedSignedInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	key, cert, err := ctx.KeyStore.GetKeyPair()
+	if err != nil {
+		return nil, err
+	}
+
+	certs := [][]byte{cert}
+	if cs, ok := ctx.KeyStore.(X509ChainStore); ok {
+		certs, err = cs.GetChain()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	rawSignature, err := rsa.SignPKCS1v15(rand.Reader, key, ctx.Hash, digest)
+	if err != nil {
+		return nil, err
+	}
+
+	signatureValue := ctx.createNamespacedElement(sig, SignatureValueTag)
+	signatureValue.SetText(base64.StdEncoding.EncodeToString(rawSignature))
+
+	keyInfo := ctx.createNamespacedElement(sig, KeyInfoTag)
+	x509Data := ctx.createNamespacedElement(keyInfo, X509DataTag)
+	for _, cert := range certs {
+		x509Certificate := ctx.createNamespacedElement(x509Data, X509CertificateTag)
+		x509Certificate.SetText(base64.StdEncoding.EncodeToString(cert))
+	}
+
+	return sig, nil
 }
 
 func (ctx *SigningContext) ConstructSignature(el *etree.Element, enveloped bool) (*etree.Element, error) {
